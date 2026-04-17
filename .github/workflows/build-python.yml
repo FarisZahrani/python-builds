@@ -1,0 +1,259 @@
+name: Build Source Portable Python
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: "Force build even if latest release already has same versions."
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      release_tag:
+        description: "Optional release tag (example: 2026.04.16). If set, create GitHub release."
+        required: false
+        type: string
+  schedule:
+    - cron: "30 3 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      versions_json: ${{ steps.resolve.outputs.versions_json }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+      matrix: ${{ steps.make-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - id: resolve
+        run: |
+          python scripts/resolve_latest_patch.py --majors-file config/majors.json > versions.json
+          echo "versions_json=$(jq -c . versions.json)" >> "$GITHUB_OUTPUT"
+          cat versions.json
+
+      - id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          FORCE="${{ github.event.inputs.force_rebuild }}"
+          EVENT="${{ github.event_name }}"
+          CURRENT="$(jq -r 'to_entries | map(.value) | sort | join(",")' versions.json)"
+          LATEST_RELEASE_TAG="$(gh release list --limit 1 --json tagName --jq '.[0].tagName // ""')"
+          LAST=""
+
+          if [ -n "${LATEST_RELEASE_TAG}" ]; then
+            LAST="$(echo "${LATEST_RELEASE_TAG}" | sed -E 's/^python-//')"
+          fi
+
+          echo "current_versions=${CURRENT}"
+          echo "latest_release_versions=${LAST}"
+
+          if [ "${FORCE}" = "true" ] || [ "${EVENT}" = "schedule" ] || [ "${CURRENT}" != "${LAST}" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ -n "${{ github.event.inputs.release_tag }}" ]; then
+            echo "release_tag=${{ github.event.inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "release_tag=python-${CURRENT//,/-}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - id: make-matrix
+        shell: python
+        run: |
+          import json
+          import os
+          from pathlib import Path
+
+          versions = json.loads(Path("versions.json").read_text(encoding="utf-8"))
+          targets = [
+              {
+                  "runner": "ubuntu-24.04",
+                  "target_os": "linux",
+                  "target_arch": "x86_64",
+                  "archive_ext": ".tar.gz",
+              },
+              {
+                  "runner": "windows-2022",
+                  "target_os": "windows",
+                  "target_arch": "x86_64",
+                  "archive_ext": ".zip",
+              },
+              {
+                  "runner": "macos-13",
+                  "target_os": "macos",
+                  "target_arch": "x86_64",
+                  "archive_ext": ".tar.gz",
+              },
+              {
+                  "runner": "macos-14",
+                  "target_os": "macos",
+                  "target_arch": "arm64",
+                  "archive_ext": ".tar.gz",
+              },
+          ]
+
+          include = []
+          for major, full_version in versions.items():
+              for target in targets:
+                  artifact_name = (
+                      f"python-{full_version}-{target['target_os']}-{target['target_arch']}"
+                  )
+                  include.append(
+                      {
+                          "major": major,
+                          "python_version": full_version,
+                          "artifact_name": artifact_name,
+                          "archive_name": f"{artifact_name}{target['archive_ext']}",
+                          **target,
+                      }
+                  )
+
+          matrix = {"include": include}
+          line = f"matrix={json.dumps(matrix)}"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(line + "\n")
+
+  validate-scripts:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify Python scripts compile
+        run: python -m compileall scripts
+
+      - name: Re-resolve configured versions
+        run: |
+          python scripts/resolve_latest_patch.py --majors-file config/majors.json > versions.json
+          cat versions.json
+
+      - name: Smoke test validation CLIs
+        run: |
+          python scripts/check_stdlib.py --help
+          python scripts/validate_distribution.py --help
+
+  build:
+    needs: [check-upstream, validate-scripts]
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.check-upstream.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies (Linux)
+        if: matrix.target_os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            zlib1g-dev \
+            libbz2-dev \
+            libreadline-dev \
+            libsqlite3-dev \
+            libffi-dev \
+            liblzma-dev \
+            tk-dev \
+            uuid-dev
+
+      - name: Install build dependencies (macOS)
+        if: matrix.target_os == 'macos'
+        run: |
+          brew update
+          brew install openssl@3 sqlite xz zlib tcl-tk
+
+      - name: Build archive
+        run: |
+          python scripts/build_portable.py \
+            "${{ matrix.major }}" \
+            --target-os "${{ matrix.target_os }}" \
+            --target-arch "${{ matrix.target_arch }}" \
+            --output-dir dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.archive_name }}
+          if-no-files-found: error
+
+  validate-artifacts:
+    needs: [check-upstream, build]
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.check-upstream.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python_version }}
+
+      - name: Download built archive
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist-archive
+
+      - name: Validate packaged distribution
+        run: |
+          python scripts/validate_distribution.py \
+            "dist-archive/${{ matrix.archive_name }}" \
+            --baseline-python python \
+            --full-timeout-seconds 5
+
+  release:
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.check-upstream.outputs.should_build == 'true' }}
+    needs: [check-upstream, validate-artifacts]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-upstream.outputs.release_tag }}
+          name: Source-built Portable Python Bundle
+          generate_release_notes: true
+          files: release-assets/*
